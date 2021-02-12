@@ -1,4 +1,5 @@
-﻿using System;
+﻿using NLog;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -6,6 +7,11 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Shadowsocks.Controller;
+using Shadowsocks.Model;
+using System.Drawing;
+using ZXing;
+using ZXing.QrCode;
+using ZXing.Common;
 
 namespace Shadowsocks.Util
 {
@@ -25,6 +31,8 @@ namespace Shadowsocks.Util
 
     public static class Utils
     {
+        private static Logger logger = LogManager.GetCurrentClassLogger();
+
         private static string _tempPath = null;
 
         // return path to store temporary files
@@ -32,61 +40,63 @@ namespace Shadowsocks.Util
         {
             if (_tempPath == null)
             {
+                bool isPortableMode = Configuration.Load().portableMode;
                 try
                 {
-                    Directory.CreateDirectory(Path.Combine(Application.StartupPath, "ss_win_temp"));
-                    // don't use "/", it will fail when we call explorer /select xxx/ss_win_temp\xxx.log
-                    _tempPath = Path.Combine(Application.StartupPath, "ss_win_temp");
+                    if (isPortableMode)
+                    {
+                        _tempPath = Directory.CreateDirectory("ss_win_temp").FullName;
+                        // don't use "/", it will fail when we call explorer /select xxx/ss_win_temp\xxx.log
+                    }
+                    else
+                    {
+                        _tempPath = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), @"Shadowsocks\ss_win_temp_" + Program.ExecutablePath.GetHashCode())).FullName;
+                    }
                 }
                 catch (Exception e)
                 {
-                    Logging.Error(e);
+                    logger.Error(e);
                     throw;
                 }
             }
             return _tempPath;
         }
 
+        public enum WindowsThemeMode { Dark, Light }
+
+        // Support on Windows 10 1903+
+        public static WindowsThemeMode GetWindows10SystemThemeSetting()
+        {
+            WindowsThemeMode themeMode = WindowsThemeMode.Dark;
+            try
+            {
+                RegistryKey reg_ThemesPersonalize = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", false);
+                if (reg_ThemesPersonalize.GetValue("SystemUsesLightTheme") != null)
+                {
+                    if ((int)(reg_ThemesPersonalize.GetValue("SystemUsesLightTheme")) == 0) // 0:dark mode, 1:light mode
+                        themeMode = WindowsThemeMode.Dark;
+                    else
+                        themeMode = WindowsThemeMode.Light;
+                }
+                else
+                {
+                    throw new Exception("Reg-Value SystemUsesLightTheme not found.");
+                }
+            }
+            catch
+            {
+
+                logger.Debug(
+                        $"Cannot get Windows 10 system theme mode, return default value 0 (dark mode).");
+
+            }
+            return themeMode;
+        }
+
         // return a full path with filename combined which pointed to the temporary directory
         public static string GetTempPath(string filename)
         {
             return Path.Combine(GetTempPath(), filename);
-        }
-
-        public static void ReleaseMemory(bool removePages)
-        {
-            // release any unused pages
-            // making the numbers look good in task manager
-            // this is totally nonsense in programming
-            // but good for those users who care
-            // making them happier with their everyday life
-            // which is part of user experience
-            GC.Collect(GC.MaxGeneration);
-            GC.WaitForPendingFinalizers();
-            if (removePages)
-            {
-                // as some users have pointed out
-                // removing pages from working set will cause some IO
-                // which lowered user experience for another group of users
-                //
-                // so we do 2 more things here to satisfy them:
-                // 1. only remove pages once when configuration is changed
-                // 2. add more comments here to tell users that calling
-                //    this function will not be more frequent than
-                //    IM apps writing chat logs, or web browsers writing cache files
-                //    if they're so concerned about their disk, they should
-                //    uninstall all IM apps and web browsers
-                //
-                // please open an issue if you're worried about anything else in your computer
-                // no matter it's GPU performance, monitor contrast, audio fidelity
-                // or anything else in the task manager
-                // we'll do as much as we can to help you
-                //
-                // just kidding
-                SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle,
-                                         (UIntPtr)0xFFFFFFFF,
-                                         (UIntPtr)0xFFFFFFFF);
-            }
         }
 
         public static string UnGzip(byte[] buf)
@@ -196,7 +206,7 @@ namespace Shadowsocks.Util
             // we are building x86 binary for both x86 and x64, which will
             // cause problem when opening registry key
             // detect operating system instead of CPU
-            if (name.IsNullOrEmpty()) throw new ArgumentException(nameof(name));
+            if (string.IsNullOrEmpty(name)) throw new ArgumentException(nameof(name));
             try
             {
                 RegistryKey userKey = RegistryKey.OpenBaseKey(hive,
@@ -211,7 +221,7 @@ namespace Shadowsocks.Util
             }
             catch (Exception e)
             {
-                Logging.LogUsefulException(e);
+                logger.LogUsefulException(e);
                 return null;
             }
         }
@@ -221,11 +231,47 @@ namespace Shadowsocks.Util
             return Environment.OSVersion.Version.Major > 5;
         }
 
-        [DllImport("kernel32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetProcessWorkingSetSize(IntPtr process,
-            UIntPtr minimumWorkingSetSize, UIntPtr maximumWorkingSetSize);
+        public static string ScanQRCodeFromScreen()
+        {
+            foreach (Screen screen in Screen.AllScreens)
+            {
+                using (Bitmap fullImage = new Bitmap(screen.Bounds.Width,
+                                                screen.Bounds.Height))
+                {
+                    using (Graphics g = Graphics.FromImage(fullImage))
+                    {
+                        g.CopyFromScreen(screen.Bounds.X,
+                                         screen.Bounds.Y,
+                                         0, 0,
+                                         fullImage.Size,
+                                         CopyPixelOperation.SourceCopy);
+                    }
+                    int maxTry = 10;
+                    for (int i = 0; i < maxTry; i++)
+                    {
+                        int marginLeft = (int)((double)fullImage.Width * i / 2.5 / maxTry);
+                        int marginTop = (int)((double)fullImage.Height * i / 2.5 / maxTry);
+                        Rectangle cropRect = new Rectangle(marginLeft, marginTop, fullImage.Width - marginLeft * 2, fullImage.Height - marginTop * 2);
+                        Bitmap target = new Bitmap(screen.Bounds.Width, screen.Bounds.Height);
 
+                        double imageScale = (double)screen.Bounds.Width / (double)cropRect.Width;
+                        using (Graphics g = Graphics.FromImage(target))
+                        {
+                            g.DrawImage(fullImage, new Rectangle(0, 0, target.Width, target.Height),
+                                            cropRect,
+                                            GraphicsUnit.Pixel);
+                        }
+                        var source = new BitmapLuminanceSource(target);
+                        var bitmap = new BinaryBitmap(new HybridBinarizer(source));
+                        QRCodeReader reader = new QRCodeReader();
+                        var result = reader.decode(bitmap);
+                        if (result != null)
+                            return result.Text;
+                    }
+                }
+            }
+            return null;
+        }
 
         // See: https://msdn.microsoft.com/en-us/library/hh925568(v=vs.110).aspx
         public static bool IsSupportedRuntimeVersion()
